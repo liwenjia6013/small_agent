@@ -16,6 +16,7 @@ python3 agent.py       # http://127.0.0.1:8090
 - 流式渲染是增量的：已定稿的块（以空行分隔、代码围栏已闭合）只解析并插入一次，每帧只重解析还没写完的那一块。60k 长回复从「整段重绘 20.6ms/帧」降到中位 2.5ms/帧（`python3 test_perf.py` 跑回归）。
 - `python3 agent.py --selftest` 检查工具/技能/配置读写；`python3 test_smoke.py` 起 mock `/v1` 跑完整回合 + 配置与技能 API；`python3 test_frontend_probe.py` 生成 `/tmp/agent_probe.html`（清洗逻辑 PASS/FAIL）和 `/tmp/agent_sim.html`（用假 SSE 流跑一遍 `send()`，dump 出轮次分组的 DOM 结构）；`python3 test_perf.py` 生成 `/tmp/agent_perf.html`，量长回复下每帧重绘耗时，标题 `PERF PASS` 才算过。
 - 只绑 127.0.0.1；bash 能执行任意命令，别暴露到公网（改 HOST 会被拒绝，真要暴露得加 `SMALL_AGENT_ALLOW_PUBLIC=1`）。
+- Windows 也能跑（Python 3.8+，无额外依赖）：`bash` 工具会优先找 Git Bash / WSL 的 `bash`，找不到就退回 `cmd.exe`（此时 `ls/cat/grep` 不可用，系统提示会告诉模型换 `dir/type/findstr`）。想要完整的 shell 语义就装 Git for Windows 并把 `C:\Program Files\Git\bin` 加进 PATH。
 
 ## Web 设置（右上角 ⚙）
 

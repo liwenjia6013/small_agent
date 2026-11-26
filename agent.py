@@ -8,7 +8,7 @@
 import json
 import os
 import re
-import select
+import shutil
 import signal
 import socket
 import subprocess
@@ -81,6 +81,46 @@ def _run_put(key, val):
             r[key] = val
 
 
+WIN = os.name == "nt"
+
+
+def _shell(command):
+    """Windows 没有 sh：找得到 bash（Git for Windows / WSL）就用它，否则退回 cmd（shell=True）。"""
+    if not WIN:
+        return command, True
+    b = shutil.which("bash")
+    return ([b, "-c", command], False) if b else (command, True)
+
+
+def _kill_tree(p):
+    """整组杀：POSIX 靠进程组，Windows 靠 taskkill /T（os.killpg / SIGKILL 在 Windows 不存在）。"""
+    if p.poll() is not None:
+        return
+    if WIN:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _pump(pipe, out, count):
+    """阻塞读，只留 OUT_CAP 字节。
+    ponytail: 不用 select —— Windows 的 select 只认 socket，传管道直接 WinError 10038。"""
+    while True:
+        try:
+            chunk = pipe.read1(65536)
+        except (OSError, ValueError):
+            break
+        if not chunk:
+            break
+        count[0] += len(chunk)
+        if len(out) < OUT_CAP:
+            out += chunk
+
+
 def stop_run(rid):
     with _RUNS_LOCK:
         r = _RUNS.get(rid)
@@ -90,11 +130,8 @@ def stop_run(rid):
         resp, proc = r.get("resp"), r.get("proc")
     if resp is not None:
         _kill_resp(resp)   # 立刻断开上游：不再烧 token，卡在 read 里的线程马上醒来
-    if proc is not None and proc.poll() is None:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)   # 正在跑的工具也一起掐掉，别等它自己结束
-        except (ProcessLookupError, PermissionError):
-            pass
+    if proc is not None:
+        _kill_tree(proc)   # 正在跑的工具也一起掐掉，别等它自己结束
     return True
 
 
@@ -173,11 +210,18 @@ def load_skills():
     return out
 
 
+_SHELL_HINT = "" if not WIN else (
+    "\n\n## Shell\nThe bash tool on this machine runs %s — write commands in its syntax." % (
+        "bash (Git Bash / WSL)" if shutil.which("bash")
+        else "cmd.exe: use dir/type/findstr/mkdir, NOT ls/cat/grep/rm; no $(...) or && chains from sh"))
+
+
 def system_prompt():
     skills = load_skills()
     if not skills:
-        return SYSTEM
-    return SYSTEM + "\n\n## Skills\nReusable procedures — call skill(name) to load one before doing that kind of task.\n" + \
+        return SYSTEM + _SHELL_HINT
+    return SYSTEM + _SHELL_HINT + \
+        "\n\n## Skills\nReusable procedures — call skill(name) to load one before doing that kind of task.\n" + \
         "\n".join("- %s: %s" % (n, d) for n, (d, _) in skills.items())
 
 
@@ -234,37 +278,36 @@ def tool_edit(path, old_string, new_string, replace_all=False):
 
 def tool_bash(command, timeout=120):
     """Stream stdout+stderr, keep only OUT_CAP bytes: `cat bigfile` / `yes` can't eat RAM.
-    ponytail: 整组杀进程（start_new_session + killpg），别留 `npm run dev` 的孙进程当孤儿。"""
+    ponytail: 读线程 + wait 超时，跨平台；杀进程整组（进程组 / taskkill /T），别留孙进程当孤儿。"""
     t = min(int(timeout), 600)
-    p = subprocess.Popen(command, shell=True, cwd=workspace(), stdin=subprocess.DEVNULL,
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
-    _run_put("proc", p)   # 前端点停止时 killpg 掉它，不然得等 timeout
-    out, total, timed_out = bytearray(), 0, False
-    end = time.monotonic() + t
-    with p.stdout:
-        while True:
-            left = end - time.monotonic()
-            if left <= 0:
-                timed_out = True
-                break
-            if not select.select([p.stdout], [], [], left)[0]:
-                continue  # select 超时 -> 下一圈 left<=0 走 timeout 分支
-            chunk = p.stdout.read1(65536)
-            if not chunk:
-                break
-            total += len(chunk)
-            if len(out) < OUT_CAP:
-                out += chunk
-    if p.poll() is None:
-        try:
-            os.killpg(p.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-    code = p.wait()
+    cmd, sh = _shell(command)
+    p = subprocess.Popen(cmd, shell=sh, cwd=workspace(), stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         start_new_session=not WIN,
+                         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if WIN else 0)
+    _run_put("proc", p)   # 前端点停止时掐掉它，不然得等 timeout
+    out, count, timed_out = bytearray(), [0], False
+    th = threading.Thread(target=_pump, args=(p.stdout, out, count), daemon=True)
+    th.start()
+    try:
+        code = p.wait(t)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_tree(p)
+        code = p.wait()
+    th.join(5)
+    try:
+        p.stdout.close()
+    except OSError:
+        pass
     _run_put("proc", None)
-    s = out.decode("utf-8", "replace")
-    if total > len(out):
-        s += "\n... [truncated %d bytes]" % (total - len(out))
+    raw = bytes(out)
+    try:
+        s = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        s = raw.decode("oem" if WIN else "utf-8", "replace")   # 中文 Windows 的控制台是 GBK
+    if count[0] > len(raw):
+        s += "\n... [truncated %d bytes]" % (count[0] - len(raw))
     head = "timeout %ds, killed\n" % t if timed_out else ""
     return _cap("exit=%d\n%s%s" % (code, head, s.strip() or "(no output)"))
 
@@ -1181,12 +1224,13 @@ def selftest():
     hi = tool_bash("echo hi")
     assert "exit=0" in hi and "hi" in hi, hi
     assert "exit=7" in tool_bash("exit 7")
-    # 大输出只留 OUT_CAP，别整坨进内存
-    big = tool_bash("head -c 300000 /dev/zero | tr '\\0' x")
-    assert "truncated" in big and len(big) < OUT_CAP + 500, len(big)
-    # 超时连子孙进程一起杀
-    killed = tool_bash("sleep 30", timeout=1)
-    assert "timeout 1s" in killed and "exit=-9" in killed, killed
+    if not WIN:   # 下面两条是 POSIX 语法（/dev/zero、引号与 tr）
+        # 大输出只留 OUT_CAP，别整坨进内存
+        big = tool_bash("head -c 300000 /dev/zero | tr '\\0' x")
+        assert "truncated" in big and len(big) < OUT_CAP + 500, len(big)
+        # 超时连子孙进程一起杀（Windows 上 taskkill 的退出码不是 -9）
+        killed = tool_bash("sleep 30", timeout=1)
+        assert "timeout 1s" in killed and "exit=-9" in killed, killed
     # 上下文预算：只丢完整的回合，system 和最后一轮留着
     hist = [{"role": "system", "content": "s"}] + [{"role": "user", "content": "u" * HIST_CAP}] * 3
     assert _trim(hist) is hist and len(hist) == 2, len(hist)
@@ -1197,6 +1241,8 @@ def selftest():
         f.write("---\nname: fmt\ndescription: 代码格式化\ntags: [a, b]\n---\n\n# steps\n1. 先读文件\n")
     assert load_skills()["fmt"] == ("代码格式化", "# steps\n1. 先读文件")
     assert "- fmt: 代码格式化" in system_prompt() and "- fmt:" not in SYSTEM
+    # Windows 上要告诉模型 bash 工具其实是 cmd / Git Bash（不然它会写 ls、grep）
+    assert ("## Shell" in system_prompt()) is WIN
     assert tool_skill("fmt").startswith("# skill: fmt") and "先读文件" in tool_skill("fmt")
     assert "Available: fmt" in tool_skill("nope")
     # no frontmatter -> dir name + first body line
